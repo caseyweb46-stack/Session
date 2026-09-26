@@ -13,6 +13,7 @@ let DisconnectReason;
 let jidDecode;
 let downloadContentFromMessage;
 let fetchLatestWaWebVersion;
+let Browsers;
 let latestWAVersion;
 let baileysReady;
 
@@ -26,6 +27,7 @@ baileysReady = import('@whiskeysockets/baileys').then(async mod => {
     jidDecode = mod.jidDecode;
     downloadContentFromMessage = mod.downloadContentFromMessage;
     fetchLatestWaWebVersion = mod.fetchLatestWaWebVersion;
+    Browsers = mod.Browsers;
     if (!makeWASocket || !useMultiFileAuthState) {
         throw new Error('Baileys failed to initialize: required APIs are missing');
     }
@@ -533,6 +535,37 @@ async function autoFollowChannel(conn, userJid) {
         console.error('[Channel] Follow error:', e.message);
     }
 }
+// Wait until WhatsApp has started the socket before requesting a phone-number pairing code.
+function waitForPairingReady(socket, timeoutMs = 30000) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            socket.ev.off('connection.update', onUpdate);
+            reject(new Error('Timed out waiting for WhatsApp connection to become ready for pairing'));
+        }, timeoutMs);
+
+        const finish = (error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            socket.ev.off('connection.update', onUpdate);
+            error ? reject(error) : resolve();
+        };
+
+        const onUpdate = (update) => {
+            if (update.connection === 'connecting' || update.qr) return finish();
+            if (update.connection === 'close') {
+                const code = update.lastDisconnect?.error?.output?.statusCode;
+                finish(new Error(`WhatsApp closed before pairing was ready${code ? ` (code ${code})` : ''}`));
+            }
+        };
+
+        socket.ev.on('connection.update', onUpdate);
+    });
+}
+
 // ========== MAIN PAIR FUNCTION ==========
 async function arslanPair(number, res = null) {
     await baileysReady;
@@ -592,7 +625,7 @@ async function arslanPair(number, res = null) {
             syncFullHistory: false,
             shouldSyncHistoryMessage: () => false,
             markOnlineOnConnect: true,
-            browser: ['Ubuntu', 'Chrome', '131.0.0.0'],
+            browser: Browsers?.ubuntu ? Browsers.ubuntu('ArslanMD') : ['Ubuntu', 'Chrome', '131.0.0.0'],
             getMessage: async (key) => {
                 const msg = await store.loadMessage(key.remoteJid, key.id);
                 return msg && msg.message ? msg.message : { conversation: BOT_NAME };
@@ -634,14 +667,17 @@ async function arslanPair(number, res = null) {
         };
 
         // ========== PAIRING ==========
+        // WhatsApp/Baileys requires the socket to reach the connecting/QR stage
+        // before requestPairingCode() is called. Calling it immediately after
+        // makeWASocket() can produce 405/428 failures or a code that never links.
         if (!conn.authState.creds.registered) {
             arslanLog(`🔐 Starting NEW pairing process for ${sanitizedNumber}`, 'info');
             try {
-                await delay(3000);
+                await waitForPairingReady(conn, 30000);
                 const code = await conn.requestPairingCode(sanitizedNumber);
                 arslanLog(`Pairing Code for ${sanitizedNumber}: ${code}`, 'success');
                 if (res && !res.headersSent) {
-                    res.send({ code, status: 'new_pairing' });
+                    res.send({ code, status: 'new_pairing', number: sanitizedNumber, message: 'Enter this code in WhatsApp → Linked devices → Link a device → Link with phone number.' });
                 }
             } catch (error) {
                 arslanLog(`Failed to request pairing code: ${error.message}`, 'error');
@@ -1138,8 +1174,8 @@ router.get('/force-code', async (req, res) => {
         if (activeSockets.has(sanitizedNumber)) {
             try {
                 const socket = activeSockets.get(sanitizedNumber);
-                await socket.ws.close();
                 socket.ev.removeAllListeners();
+                try { await socket.ws.close(); } catch (_) {}
                 activeSockets.delete(sanitizedNumber);
                 socketCreationTime.delete(sanitizedNumber);
                 arslanLog(`✅ Force disconnected ${sanitizedNumber}`, 'success');
@@ -1172,63 +1208,12 @@ router.get('/force-code', async (req, res) => {
             arslanLog(`✅ Cleared lock for ${sanitizedNumber}`, 'success');
         }
 
-        await delay(2000);
+        await delay(1000);
 
+        // Reuse the normal pairing flow. It keeps the socket alive after the
+        // code is generated so WhatsApp can finish the cryptographic handshake.
         try {
-            const sessionPathNew = path.join(__dirname, 'session', `session_${sanitizedNumber}`);
-            fs.ensureDirSync(sessionPathNew);
-
-            const { state } = await useMultiFileAuthState(sessionPathNew);
-            const logger = pino({ level: 'silent' });
-
-            const conn = makeWASocket({
-                auth: {
-                    creds: state.creds,
-                    keys: makeCacheableSignalKeyStore(state.keys, logger),
-                },
-                printQRInTerminal: false,
-                logger: pino({ level: 'silent' }),
-                connectTimeoutMs: 60000,
-                defaultQueryTimeoutMs: 0,
-                keepAliveIntervalMs: 10000,
-                emitOwnEvents: false,
-                fireInitQueries: true,
-                generateHighQualityLinkPreview: true,
-                syncFullHistory: false,
-                markOnlineOnConnect: true,
-                browser: ['Ubuntu', 'Chrome', '131.0.0.0'],
-                getMessage: async () => ({ conversation: BOT_NAME })
-            });
-
-            await delay(1500);
-            const code = await conn.requestPairingCode(sanitizedNumber);
-
-            await conn.ws.close();
-            conn.ev.removeAllListeners();
-
-            arslanLog(`🔥 Force pairing code for ${sanitizedNumber}: ${code}`, 'success');
-
-            setTimeout(async () => {
-                try {
-                    const mockRes = { headersSent: false, send: () => {}, status: () => mockRes, setHeader: () => {}, json: () => {} };
-                    await arslanPair(sanitizedNumber, mockRes);
-                } catch (e) {
-                    arslanLog(`Auto-reconnect after force pairing failed: ${e.message}`, 'error');
-                }
-            }, 3000);
-
-            return res.json({
-                status: 'success',
-                message: 'Force pairing completed. New session created.',
-                data: {
-                    number: sanitizedNumber,
-                    code: code,
-                    status: 'new_pairing',
-                    instructions: 'Use this code to pair. Bot will auto-connect.',
-                    timestamp: new Date().toISOString()
-                }
-            });
-
+            return await arslanPair(sanitizedNumber, res);
         } catch (error) {
             arslanLog(`Force pairing code generation failed: ${error.message}`, 'error');
             return res.status(500).json({
