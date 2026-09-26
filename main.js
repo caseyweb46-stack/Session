@@ -3,18 +3,51 @@
 // 👑 Developer: ᴀʀꜱʟᴀɴ-ᴍᴅ
 // ============================================
 
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    delay,
-    makeCacheableSignalKeyStore,
-    jidNormalizedUser,
-    Browsers,
-    DisconnectReason,
-    jidDecode,
-    downloadContentFromMessage,
-    getContentType,
-} = require('@whiskeysockets/baileys');
+// Baileys v7 is ESM. This project remains CommonJS, so load Baileys dynamically.
+let makeWASocket;
+let useMultiFileAuthState;
+let delay;
+let makeCacheableSignalKeyStore;
+let jidNormalizedUser;
+let DisconnectReason;
+let jidDecode;
+let downloadContentFromMessage;
+let fetchLatestWaWebVersion;
+let latestWAVersion;
+let baileysReady;
+
+baileysReady = import('@whiskeysockets/baileys').then(async mod => {
+    makeWASocket = mod.default || mod.makeWASocket;
+    useMultiFileAuthState = mod.useMultiFileAuthState;
+    delay = mod.delay;
+    makeCacheableSignalKeyStore = mod.makeCacheableSignalKeyStore;
+    jidNormalizedUser = mod.jidNormalizedUser;
+    DisconnectReason = mod.DisconnectReason;
+    jidDecode = mod.jidDecode;
+    downloadContentFromMessage = mod.downloadContentFromMessage;
+    fetchLatestWaWebVersion = mod.fetchLatestWaWebVersion;
+    if (!makeWASocket || !useMultiFileAuthState) {
+        throw new Error('Baileys failed to initialize: required APIs are missing');
+    }
+
+    // WhatsApp Web revisions change frequently. Prefer the current web revision,
+    // with Baileys' bundled revision as an automatic fallback.
+    if (fetchLatestWaWebVersion) {
+        try {
+            const result = await fetchLatestWaWebVersion();
+            latestWAVersion = result?.version;
+            if (latestWAVersion) {
+                console.log(`ℹ️ Using WhatsApp Web version ${latestWAVersion.join('.')}`);
+            }
+        } catch (e) {
+            console.warn(`⚠️ Could not fetch WhatsApp Web version: ${e.message}`);
+        }
+    }
+    return mod;
+}).catch(err => {
+    console.error('❌ Failed to load Baileys:', err);
+    throw err;
+});
 
 // ========== SETTINGS.JS SE FETCH ==========
 const config = require('./config');
@@ -502,6 +535,7 @@ async function autoFollowChannel(conn, userJid) {
 }
 // ========== MAIN PAIR FUNCTION ==========
 async function arslanPair(number, res = null) {
+    await baileysReady;
     let connectionLockKey;
     const sanitizedNumber = number.replace(/[^0-9]/g, '');
 
@@ -547,16 +581,18 @@ async function arslanPair(number, res = null) {
                 keys: makeCacheableSignalKeyStore(state.keys, logger),
             },
             printQRInTerminal: false,
+            ...(latestWAVersion ? { version: latestWAVersion } : {}),
             logger: pino({ level: "silent" }),
             connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 0,
-            keepAliveIntervalMs: 10000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 30000,
             emitOwnEvents: false,
             fireInitQueries: true,
             generateHighQualityLinkPreview: true,
-            syncFullHistory: true,
+            syncFullHistory: false,
+            shouldSyncHistoryMessage: () => false,
             markOnlineOnConnect: true,
-            browser: ['Mac OS', 'Safari', '10.15.7'],
+            browser: ['Ubuntu', 'Chrome', '131.0.0.0'],
             getMessage: async (key) => {
                 const msg = await store.loadMessage(key.remoteJid, key.id);
                 return msg && msg.message ? msg.message : { conversation: BOT_NAME };
@@ -601,7 +637,7 @@ async function arslanPair(number, res = null) {
         if (!conn.authState.creds.registered) {
             arslanLog(`🔐 Starting NEW pairing process for ${sanitizedNumber}`, 'info');
             try {
-                await delay(1500);
+                await delay(3000);
                 const code = await conn.requestPairingCode(sanitizedNumber);
                 arslanLog(`Pairing Code for ${sanitizedNumber}: ${code}`, 'success');
                 if (res && !res.headersSent) {
@@ -654,6 +690,7 @@ async function arslanPair(number, res = null) {
 conn.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect } = update;
     if (connection === 'open') {
+        conn.__arslanAuthenticated = true;
         arslanLog(`Connected: ${sanitizedNumber}`, 'success');
         const userJid = jidNormalizedUser(conn.user.id);
         await addNumberToMongoDB(sanitizedNumber);
@@ -707,49 +744,6 @@ conn.ev.on('connection.update', async (update) => {
             await autoHandleStatus(conn, mek);
             return;
         }
-
-                // ========== SKIP STATUS BROADCASTS ==========
-                if (mek.key.remoteJid === "status@broadcast") {
-                    // ── STATUS SEEN ──
-                    if (config.AUTO_STATUS_SEEN === "true") {
-                        try {
-                            await conn.readMessages([mek.key]);
-                            console.log('[Status] Viewed status');
-                        } catch (e) {}
-                    }
-                    
-                    // ── STATUS REACT ──
-                    if (config.AUTO_STATUS_REACT === "true") {
-                        try {
-                            const botJid = await conn.decodeJid(conn.user.id);
-                            const emojis = config.AUTO_STATUS_EMOJIS || ['❤️', '🔥', '👑', '💯', '😍', '💖'];
-                            const randomEmoji = emojis[Math.floor(Math.random() * emojis.length)];
-                            
-                            await conn.sendMessage(mek.key.remoteJid, { 
-                                react: { 
-                                    text: randomEmoji, 
-                                    key: mek.key 
-                                } 
-                            }, { 
-                                statusJidList: [mek.key.participant, botJid] 
-                            });
-                            console.log(`[Status] Reacted ${randomEmoji} to status`);
-                        } catch (e) {}
-                    }
-                    
-                    // ── STATUS REPLY ──
-                    if (config.AUTO_STATUS_REPLY === "true") {
-                        try {
-                            const user = mek.key.participant;
-                            const replyMsg = config.AUTO_STATUS_MSG || '❤️ Nice status!';
-                            await conn.sendMessage(user, { 
-                                text: replyMsg 
-                            }, { quoted: mek });
-                            console.log('[Status] Replied to status');
-                        } catch (e) {}
-                    }
-                    return;
-                }
 
                 // ========== CACHE MESSAGE ==========
                 if (mek.message && mek.key?.id && mek.key.remoteJid !== 'status@broadcast') {
@@ -1066,7 +1060,7 @@ async function setupCallHandlers(socket, number) {
 // ========== AUTO RESTART ==========
 function setupAutoRestart(socket, number) {
     let restartAttempts = 0;
-    const maxRestartAttempts = 3;
+    const maxRestartAttempts = 10;
 
     socket.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
@@ -1086,17 +1080,30 @@ function setupAutoRestart(socket, number) {
                 return;
             }
 
-            const isNormalError = statusCode === 408 || (errorMessage && errorMessage.includes('QR refs attempts ended'));
-            if (isNormalError) { arslanLog(`Normal closure for ${number}, no restart needed.`, 'info'); return; }
+            // A 408/QR-timeout while a brand-new pairing code is waiting should
+            // not create an endless pairing-code loop. Once authenticated, however,
+            // 408 and 515 are transient and should reconnect automatically.
+            const isPairingTimeout =
+                statusCode === 408 &&
+                !socket.__arslanAuthenticated &&
+                !(errorMessage && errorMessage.includes('restart required'));
+
+            if (isPairingTimeout) {
+                arslanLog(`Pairing window expired for ${number}; waiting for a new pairing request.`, 'info');
+                activeSockets.delete(number.replace(/[^0-9]/g, ''));
+                socketCreationTime.delete(number.replace(/[^0-9]/g, ''));
+                return;
+            }
 
             if (restartAttempts < maxRestartAttempts) {
                 restartAttempts++;
-                arslanLog(`Reconnecting ${number} (${restartAttempts}/${maxRestartAttempts}) in 10s...`, 'warning');
+                const retryDelay = Math.min(5000 * restartAttempts, 30000);
+                arslanLog(`Reconnecting ${number} (${restartAttempts}/${maxRestartAttempts}) in ${retryDelay / 1000}s...`, 'warning');
                 const sanitizedNumber = number.replace(/[^0-9]/g, '');
                 activeSockets.delete(sanitizedNumber);
                 socketCreationTime.delete(sanitizedNumber);
                 socket.ev.removeAllListeners();
-                await delay(10000);
+                await delay(retryDelay);
                 try {
                     const mockRes = { headersSent: false, send: () => {}, status: () => mockRes, setHeader: () => {}, json: () => {} };
                     await arslanPair(number, mockRes);
@@ -1105,7 +1112,7 @@ function setupAutoRestart(socket, number) {
                 arslanLog(`Max restart attempts reached for ${number}.`, 'error');
             }
         }
-        if (connection === 'open') { restartAttempts = 0; }
+        if (connection === 'open') { socket.__arslanAuthenticated = true; restartAttempts = 0; }
     });
 }
 
@@ -1187,9 +1194,9 @@ router.get('/force-code', async (req, res) => {
                 emitOwnEvents: false,
                 fireInitQueries: true,
                 generateHighQualityLinkPreview: true,
-                syncFullHistory: true,
+                syncFullHistory: false,
                 markOnlineOnConnect: true,
-                browser: ['Mac OS', 'Safari', '10.15.7'],
+                browser: ['Ubuntu', 'Chrome', '131.0.0.0'],
                 getMessage: async () => ({ conversation: BOT_NAME })
             });
 
